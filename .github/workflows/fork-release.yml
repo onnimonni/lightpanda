@@ -1,0 +1,102 @@
+name: fork release
+
+# Fork-only: builds release binaries with the same recipe as release.yml
+# (without its S3/docker/distribution steps, which need upstream secrets) and
+# publishes them as a GitHub release of this fork.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: fork-<date>-<short sha>)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: linux
+            runner: ubuntu-22.04
+            flags: -Dcpu=x86_64 -Dorderfile=orderfile/lightpanda.ld
+          - arch: aarch64
+            os: linux
+            runner: ubuntu-24.04-arm
+            flags: -Dcpu=generic -Dorderfile=orderfile/lightpanda.ld
+          - arch: aarch64
+            os: macos
+            runner: macos-14
+            flags: ""
+          - arch: x86_64
+            os: macos
+            runner: macos-15-intel
+            flags: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install
+        with:
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+
+      - name: version
+        id: version
+        run: |
+          base=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
+          echo "version=${base}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: v8 snapshot
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
+
+      - name: zig build
+        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast ${{ matrix.flags }} -Dversion=${{ steps.version.outputs.version }}
+
+      - name: smoke test
+        run: |
+          ./zig-out/bin/lightpanda version
+          ./zig-out/bin/lightpanda fetch --dump html https://example.com | grep -q "Example Domain"
+
+      - name: rename binary
+        run: mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-${{ matrix.os }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lightpanda-${{ matrix.arch }}-${{ matrix.os }}
+          path: lightpanda-${{ matrix.arch }}-${{ matrix.os }}
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          cd dist
+          chmod +x lightpanda-*
+          sha256sum lightpanda-* > SHA256SUMS
+          cat SHA256SUMS
+          tag="${TAG:-fork-$(date -u +%Y-%m-%d)-$(git rev-parse --short HEAD)}"
+          gh release create "$tag" lightpanda-* SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "$tag" \
+            --notes "Built from $GITHUB_SHA with fork-release.yml (same recipe as upstream release.yml)."
