@@ -1,0 +1,44 @@
+name: nix-build
+
+# Builds the flake's lightpanda package natively on each platform.
+on:
+  push:
+    branches: [ci/nix-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
+          - system: x86_64-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: nix build
+        # Linux is experimental (not in meta.platforms yet).
+        env:
+          NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM: 1
+        run: nix build --impure .#packages.${{ matrix.system }}.default -L
+
+      - name: smoke test
+        run: |
+          ./result/bin/lightpanda version
+          ./result/bin/lightpanda fetch --dump html https://example.com | tee page.html
+          grep -q "Example Domain" page.html
